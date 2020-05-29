@@ -1,0 +1,473 @@
+---
+title: "Kaggle: Predicting Survival on the Titanic"
+author: "Anthony Pan"
+date: "2020-05-07"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: "hide"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(caretEnsemble)
+library(randomForest)
+library(tidyverse)
+library(doMC)
+registerDoMC(5)
+```
+
+## Introduction
+
+This is my first Kaggle exercise! The goal is to predict which passengers survived the Titanic shipwreck, given a set of attributes about the passengers. This file takes < 60 seconds to knit, and as of May 2020, the result places within the top 12% of submissions.
+
+Kaggle allows us to skip the processes of data gathering, architecture, governance, and extraction, so we can move straight to importing and cleaning the data.
+
+### Import Data
+
+The training data has 891 observations, and the test data has 418 observations. 
+
+For each passenger, there are 10 predictors along with their passenger ID:
+
+- Pclass (ticket class, proxy for socio-economic status)
+- Name (passenger name: Last, First)
+- Sex (male/female)
+- Age (years)
+- SibSp (# siblings and spouses aboard the Titanic)
+- Parch (# parents and children abard the Titanic)
+- Ticket (ticket number)
+- Fare (passenger fare)
+- Cabin (cabin number)
+- Embarked (port of embarkation: Cherbourg, Queenstown, or Southampton)
+
+
+```{r import_data, message=FALSE}
+train <- read_csv("train.csv")
+test <- read_csv("test.csv")
+head(train)
+```
+
+## Data Wrangling
+
+### Exploration: Sex
+
+Sex had a very disproportionate effect on survival on the Titanic. We can see that approximately 75% of females survived, compared to less than 20% of males. 
+
+```{r exploration_sex}
+train %>%
+  group_by(Sex) %>%
+  summarize(Survived = sum(Survived),
+            Total = n(),
+            Proportion = Survived/Total) %>%
+  ggplot() +
+    geom_col(mapping = aes(x = Sex, y = Proportion)) + 
+    labs(title = "Titanic Survival Rate by Sex", y = "Survival Rate")
+```
+
+
+### Exploration: Ticket Class
+
+Ticket class seems to greatly affect survival rate as well. More than 60% of 1st class passengers survived, while less than 25% of 3rd class passengers did.
+
+```{r exploration_pclass}
+train %>%
+  group_by(Pclass) %>%
+  summarize(Survived = sum(Survived),
+            Total = n(),
+            Proportion = Survived/Total) %>%
+  ggplot() +
+    geom_col(mapping = aes(x = Pclass, y = Proportion)) + 
+    labs(title = "Titanic Survival Rate by Ticket Class", x = "Ticket Class", y = "Survival Rate")
+```
+
+### Feature Engineering: Title
+
+I created a new variable called "Title" to represent the passenger's title extracted from their name. 
+
+There were a number of infrequently occuring titles, so I decided to fit them all into five categories: "Master", "Mr", "Mrs", "Miss", and "Royal" (for titles that indicated royalty). We can see that passengers with different titles have significantly different survival rates.
+
+```{r feature_eng_1}
+### create Title from Name (train)
+titles <- (str_extract(train$Name, pattern = "(?<=, ).+(?=\\. )"))
+titles <- str_replace_all(titles, c("Jonkheer" = "Mr",
+                                "Capt" = "Mr",
+                                "Col" = "Mr",
+                                "Don" = "Mr",
+                                "Major" = "Mr", 
+                                "Rev" = "Mr",
+                                "Sir" = "Royal",
+                                "Dr" = "Mr",
+                                "Lady" = "Royal",
+                                "Mme" = "Mrs",
+                                "Mrs. Martin \\(Elizabeth L" = "Mrs",
+                                "the Countess" = "Royal",
+                                "Mlle" = "Mrs",
+                                "Ms" = "Miss"))
+titles[797] <- "Mrs" # handle special case of female doctor
+train$Title <- titles
+table(train$Title) # Master, Miss, Mr, Mrs, Royal
+
+### create Title from Name (test)
+titles <- (str_extract(test$Name, pattern = "(?<=, ).+(?=\\. )"))
+titles <- str_replace_all(titles, c("Col" = "Mr",
+                                "Dona" = "Mrs",
+                                "Dr" = "Mr",
+                                "Ms" = "Miss",
+                                "Rev" = "Mr"))
+test$Title <- titles
+table(test$Title) # Master, Miss, Mr, Mrs
+
+rm(titles)
+
+### graph survival rate by title
+train %>%
+  group_by(Title) %>%
+  summarize(Survived = sum(Survived), 
+            Total = n(),
+            Proportion = Survived/Total) %>%
+  ggplot() +
+    geom_col(mapping = aes(x = Title, y = Proportion)) +
+    labs(title = "Titanic Survival Rate By Passenger Title", y = "Survival Rate")
+
+```
+
+### Feature Engineering: Family
+I also created a new variable called "Family" from the sum of "SibSp" and "Parch" to represent the total number of the passenger's family members aboard the Titanic. We can see that survival rates are significantly different among those with varying numbers of family members aboard.
+
+```{r feature_eng_2}
+### create Family from SibSp and Parch
+train$Family <- train$SibSp + train$Parch
+test$Family <- test$SibSp + test$Parch
+
+### graph survival rate by family
+train %>%
+  group_by(Family) %>%
+  summarize(Survived = sum(Survived), 
+            Total = n(),
+            Proportion = Survived/Total) %>%
+  ggplot() +
+    geom_col(mapping = aes(x = Family, y = Proportion)) +
+    labs(title = "Titanic Survival Rate By Family", y = "Survival Rate") +
+    scale_x_continuous(breaks = seq(1, 10, by = 1))
+
+```
+
+### Missing Values: Overview
+
+The training data is missing:
+
+- 687 values of "Cabin"
+- 177 values of "Age"
+- 2 values of "Embarked" 
+
+The test data data is missing:
+
+- 327 values of "Cabin"
+- 86 values of "Age"
+- 1 value of "Fare"
+
+```{r missing_values}
+summary(is.na(train)) 
+summary(is.na(test)) 
+```
+
+### Missing Values: Cabin
+
+[Accorording to Encyclopedia Titanica](https://www.encyclopedia-titanica.org/cabins.html), the letter prefix of the cabin represents the "Boat Deck" (A-G) while the number represents the room number.
+
+**We'll create a new variable called "Deck" to extract the deck information from the cabin variable.** Missing values of Cabin will be converted into a Deck value called "X". We can see that those with missing cabin values have a noticeably different survival rate than the other groups.
+
+```{r missing_cabin}
+### create Deck from Cabin
+train$Deck <- ifelse(is.na(train$Cabin), "X", substr(train$Cabin, 0, 1))
+test$Deck <- ifelse(is.na(test$Cabin), "X", substr(test$Cabin, 0, 1))
+
+### graph survival rate by deck
+train %>%
+  group_by(Deck) %>%
+  summarize(Survived = sum(Survived), 
+            Total = n(),
+            Proportion = Survived/Total) %>%
+  ggplot() +
+    geom_col(mapping = aes(x = Deck, y = Proportion)) +
+    labs(title = "Titanic Survival Rate By Deck", y = "Survival Rate")
+
+```
+
+### Missing Values: Age
+
+Age seems to play a big role in survival rate. We see that passengers who are children or in their early teens are more likely to survive, passengers in their late teens and twenties are much more likely not to survive.
+
+```{r missing_age_1}
+### histogram of age, split by whether they survived
+train %>%
+  ggplot() + 
+    geom_histogram(mapping = aes(x = Age, fill = as.factor(Survived)),
+                   bins = 15,
+                   position = "dodge") +
+    scale_fill_discrete(name = "Legend", labels = c("Did not survive", "Survived")) +
+    labs(title = "Titanic Survival By Age")
+```
+
+I use linear regression-based imputation to fill in the missing values for "Age" based on the variables "Pclass", "Title", and "Family", selected with forward stepwise selection.
+
+The residuals of the predicted values of "Age" display heteroskedasticity in both the training and test data sets, but that's acceptable for our purposes since we do not need an accurate measure of the model's coefficient standard errors for prediction.
+
+```{r missing_age_2, fig.show = 'hold', out.width = '50%'}
+### impute training data
+lm1 <- lm(Age ~ Pclass + Title + Family, train)
+summary(lm1) 
+plot(predict(lm1), resid(lm1), main = "Training Data: Residuals for Age Imputation") # heteroskedasticity
+abline(0, 0)
+
+train$Age <- ifelse(is.na(train$Age), predict(lm1, train), train$Age) # replace NAs with new values
+train$Age[train$Age < 0] <- 1 # replace one negative predicted age with 1
+
+# impute testing data
+lm2 <- lm(Age ~ Pclass + Title + Family, test)
+summary(lm2) 
+plot(predict(lm2), resid(lm2), main = "Test Data: Residuals for Age Imputation") # heteroskedasticity
+abline(0, 0)
+
+test$Age <- ifelse(is.na(test$Age), predict(lm2, test), test$Age) # replace NAs with new values
+
+rm(lm1, lm2)
+```
+
+### Missing Values: Embarked
+
+The two missing values for "Embarked" in the training data set are for the two passengers: Miss Amelie Icard and Mrs. George Nelson Stone. I found that their port of embarkation is documented in public records; Miss Icard actually boarded the Titanic as maid to Mrs. Stone, and both boarded from Southampton.[^1] 
+
+```{r missing_embarked}
+train %>% filter(is.na(Embarked))
+train$Embarked <- ifelse(is.na(train$Embarked), "S", train$Embarked)
+
+train %>%
+  group_by(Embarked) %>%
+  summarize(Survived = sum(Survived),
+            Total = n(),
+            Proportion = Survived/Total) %>%
+  ggplot() +
+    geom_col(mapping = aes(x = Embarked, y = Proportion)) + 
+    labs(title = "Titanic Survival Rate by Port of Embarkation", y = "Survival Rate")
+```
+
+### Missing Values: Fare
+
+I filled in the one missing "Fare" in the test data set with the median fare in all the data.
+
+```{r missing_fare, message = FALSE}
+full_data <- full_join(train, test)
+test$Fare <- ifelse(is.na(test$Fare),
+                    median(full_data$Fare, na.rm = TRUE),
+                    test$Fare)
+rm(full_data)
+
+### histogram of fare, split by whether they survived
+train %>%
+  ggplot() + 
+    geom_histogram(mapping = aes(x = Fare, fill = as.factor(Survived)),
+                   bins = 15,
+                   position = "dodge") +
+    scale_fill_discrete(name = "Legend", labels = c("Did not survive", "Survived")) + 
+    labs(title = "Titanic Survival By Ticket Fare")
+```
+
+### Additional Pre-Processing
+
+I perform a few more steps for ease of computation in R and increased predictive power:
+
+1. Categorical variables are encoded as factors so that R treats them as dummy variables.
+2. Deck variable converted to numeric to increase predictive power of all models.
+3. Deck^2 and Fare^2 variables are added to increase predictive power of logistic regression, LDA, and SVM.
+
+```{r create_factors}
+### Encode categorical variables as factors
+train$Survived <- factor(train$Survived)
+train$Sex <- factor(train$Sex)
+train$Title <- factor(train$Title)
+train$Embarked <- factor(train$Embarked)
+train$Deck <- factor(train$Deck)
+
+test$Sex <- factor(test$Sex)
+test$Title <- factor(test$Title)
+test$Embarked <- factor(test$Embarked)
+test$Deck <- factor(test$Deck)
+levels(test$Deck) <- c(levels(test$Deck), "T")
+levels(test$Title) <- c(levels(test$Title), "Royal")
+
+### Encode training survival rate as a factor
+train$Survived <- fct_recode(train$Survived, "Dead" = "0", "Survived" = "1")
+
+### Create numeric Deck variable, Deck^2, and Fare^2
+train$numericDeck <- as.numeric(train$Deck)
+train$numericDeckSq <- train$numericDeck ^ 2
+test$numericDeck <- as.numeric(test$Deck)
+test$numericDeckSq <- test$numericDeck ^ 2
+
+train$FareSq <- train$Fare ^ 2
+test$FareSq <- test$Fare ^ 2
+```
+
+
+## Modeling
+
+We will use 10-fold cross validation repeated 3 times to evaluate each model. The folds will be shared across models so that their predictions can be combined at the end.
+
+```{r resampling}
+set.seed(202004071)
+ctrl <- trainControl(method = "repeatedcv",
+                     classProbs = TRUE,
+                     number = 10,
+                     repeats = 3,
+                     index = createMultiFolds(train$Survived, k = 10, times = 3),
+                     savePredictions = "final")
+
+```
+
+### Logistic Regression
+
+Using logistic regression, we obtain an average cross-validated accuracy rate of 83.72%. We see that a title of "Mr", the number of family members aboard the Titanic, ticket class, and age are the 4 most important contributors to survival in the logistic model.
+
+```{r logisticReg}
+set.seed(20200407)
+logitModel <- train(Survived ~ Pclass + Sex + Age + Fare + FareSq + Embarked + numericDeck + numericDeckSq + Title + Family, data = train,
+                    method = "glm",
+                    metric = "Accuracy",
+                    trControl = ctrl)
+logitModel # Acc: .8372
+varImp(logitModel)
+plot(varImp(logitModel), main = "Logistic Model Variable Importance")
+
+```
+
+### Linear Discriminant Analysis
+
+Using linear discriminant analysis, we obtain a cross-validated accuracy of 83.56%.
+
+```{r lda}
+set.seed(20200407)
+ldaModel <- train(Survived ~ Pclass + Sex + Age + Fare + FareSq + Embarked + numericDeck + numericDeckSq + Title + Family,
+                  data = train,
+                  method = "lda",
+                  metric = "Accuracy",
+                  trControl = ctrl,
+                  preProcess = c("center", "scale"))
+ldaModel # Acc: .8356
+```
+
+### Linear SVM
+
+A linear SVM gives a cross-validated accuracy of 83.61%.
+
+```{r svmLinear}
+svmLGrid <- expand.grid(.C = 2^(-4:2))
+set.seed(20200407)
+svmLModel <- train(Survived ~ Pclass + Sex + Age + Fare + Embarked + numericDeck + numericDeckSq + Title + Family, data = train,
+                    method = "svmLinear",
+                    metric = "Accuracy",
+                    preProc = c("center", "scale"),
+                    tuneGrid = svmLGrid,
+                    trControl = ctrl)
+svmLModel # Acc = .8361
+```
+
+### Polynomial SVM
+
+A 2nd degree polynomial SVM gives a cross-validated accuracy of 83.91%.
+
+```{r svmPoly}
+svmPGrid <- expand.grid(.C = 2^(-4:1),
+                       .degree = 2,
+                       .scale = .1)
+set.seed(20200407)
+svmPModel <- train(Survived ~ Pclass + Sex + Age + Fare + Embarked + numericDeck + numericDeckSq + Title + Family, data = train,
+                    method = "svmPoly",
+                    metric = "Accuracy",
+                    preProc = c("center", "scale"),
+                    tuneGrid = svmPGrid,
+                    trControl = ctrl)
+svmPModel # Acc = .8391
+```
+
+### Random Forest Model
+
+A random forest model gives a cross-validated accuracy of 83.68%. 
+
+According to the random forest model, a title of "Mr" is the most significant variable for determining survival, followed by ticket class and fare.
+
+```{r randomForest}
+rfGrid <- expand.grid(.mtry = c(3, 5, 7, 9))
+set.seed(20200407)
+rfModel <- train(Survived ~ Pclass + Sex + Age + Fare + Embarked + numericDeck + Title + Family,
+                 data = train,
+                 method = "rf",
+                 metric = "Accuracy",
+                 trControl = ctrl,
+                 importance = TRUE,
+                 ntrees = 1000,
+                 tuneGrid = rfGrid)
+rfModel # Acc: .8368, mtry = 3
+varImp(rfModel)
+plot(varImp(rfModel), main = "Random Forest Variable Importance")
+```
+
+### Ensemble
+
+To draw on the strength of each model, we find the linear combination of all five models (logistic regression, LDA, linear SVM, polynomial SVM) that minimizes the cross-validation error.
+
+Since all of our models were trained on the same repeated 10-fold cross-validation samples, we're able to easily calculate a good linear combination of their results.
+
+The resulting average cross-validation accuracy of the ensemble 83.63%. Although this is lower than some of the individual model cross-validation scores, I expect it to be more robust. 
+
+```{r ensemble}
+tuneList <- list(glm = caretModelSpec(method = "glm"))
+
+set.seed(20200407)
+modelList <<- caretList(Survived ~ Pclass + Sex + Age + Fare + FareSq + Embarked + numericDeck + numericDeckSq + Title + Family, 
+                        data = train,
+                        trControl = ctrl,
+                        metric = "Accuracy",
+                        tuneList = tuneList)
+
+modelList[["rf"]] <-  rfModel
+modelList[["svmLinear"]] <- svmLModel
+modelList[["svmPoly"]] <-  svmPModel
+modelList[["lda"]] <- ldaModel
+
+modelCor(resamples(modelList))
+summary(resamples(modelList))
+
+parallelplot(resamples(modelList))
+
+set.seed(20200407)
+greedyEnsemble <- caretEnsemble(modelList, 
+                                metric = "Accuracy",
+                                trControl = trainControl(method = "repeatedcv", number = 10, repeats = 5))
+summary(greedyEnsemble)
+```
+
+
+## Results
+
+This model had an accuracy of 79.90% on the test dataset, which is a fairly competitive score (top 12%). 
+
+For future improvement, I would investigate the effect of different imputation strategies and feature engineering. 
+
+```{r export_submission}
+test$predictions <- predict(greedyEnsemble, test)
+test$rawpredictions <- ifelse(test$predictions == "Dead", 0, 1)
+
+submission <- tibble("PassengerId" = test$PassengerId,
+                     "Survived" = test$rawpredictions)
+
+write.csv(submission, "titanic-submission.csv", row.names = FALSE, quote = FALSE)
+```
+
+
+
+
+
