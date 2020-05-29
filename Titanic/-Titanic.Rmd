@@ -464,7 +464,7 @@ test$rawpredictions <- ifelse(test$predictions == "Dead", 0, 1)
 submission <- tibble("PassengerId" = test$PassengerId,
                      "Survived" = test$rawpredictions)
 
-write.csv(submission, "titanic-submission.csv", row.names = FALSE, quote = FALSE)
+write.csv(submission, "submission.csv", row.names = FALSE, quote = FALSE)
 ```
 
 
