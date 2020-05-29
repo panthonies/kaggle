@@ -8,4 +8,4 @@ Files in this folder:
 - *test.csv:* test data
 - *submission.csv:* my submission
 
-My submission scores in the top 12% (as of May 2020). View the final HTML rendering of my analysis [**here**](anthonypan.com/kaggle/titanic){:target="blank"}.
+My submission scores in the top 12% (as of May 2020). [**View the final HTML rendering of my analysis here**](https://anthonypan.com/kaggle/titanic).

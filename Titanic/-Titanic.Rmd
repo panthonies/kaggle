@@ -3,10 +3,11 @@ title: "Kaggle: Predicting Survival on the Titanic"
 author: "Anthony Pan"
 date: "2020-05-07"
 output: 
-  html_document:
-    toc: TRUE
-    toc_float: TRUE
-    code_folding: "hide"
+  html_document: 
+    code_folding: hide
+    keep_md: yes
+    toc: yes
+    toc_float: yes
 ---
 
 
@@ -455,7 +456,7 @@ summary(greedyEnsemble)
 
 This model had an accuracy of 79.90% on the test dataset, which is a fairly competitive score (top 12%). 
 
-For future improvement, I would investigate the effect of different imputation strategies and feature engineering. 
+Exploring other imputation strategies or different handling of feature engineering may lead to further improvements.
 
 ```{r export_submission}
 test$predictions <- predict(greedyEnsemble, test)
