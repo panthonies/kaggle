@@ -1,0 +1,350 @@
+---
+title: "Predicting House Prices in Ames, Iowa"
+author: "Anthony Pan"
+date: "2020-05-20"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: "hide"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(caretEnsemble)
+library(tidyverse)
+library(gbm)
+library(earth)
+library(corrplot)
+library(elasticnet)
+library(doMC)
+registerDoMC(5)
+library(vtreat)             ## one hot encode and ignore factor levels with low frequency
+```
+
+
+## Introduction
+
+Alright, we're going to try and predict housing prices. The goal is to predict the final sale price of residential homes in Ames, Iowa based on information about the house.
+
+The score is judged on the root mean squared error (RMSE) of the log sale price, and my submission scores in the top 13% of results (as of May 2020). This script takes approximately 8 minutes to knit.
+
+### Import Data
+
+The training data has 1460 observations, and the test data has 1459 observations. There are a total of 79 predictors, not including the house ID, which are described in detail [here](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/data).
+
+```{r import_data, message = FALSE}
+test <- read.csv("test.csv")
+train <- read.csv("train.csv")
+```
+
+## Data Pre-Processing
+
+Let's tidy up the dataset before diving into anything else.
+
+1. Remove IDs from training and test datasets for cleaner model formulas.
+2. Take the log of SalePrice in the training data, to match the evaluation method.
+3. MSSubClass (the type of dwelling involved in the sale) and MonthSold are numeric but should be factors.
+4. Test data has a house with MSSubClass = 160, but this factor level does not exist in the training data. We recode the 160 value (2-Story PUD) into its closest approximation, 150 (1-1/2 Story PUD).  
+5. Fix a typo in GarageYrBlt (changed 2207 to 2007)
+6. If YearRemodAdd (remodel date) is after YrSold (year sold), set YearRemodAdd to YrSold.
+
+```{r preproc1}
+## separate IDs
+id_train <- train$Id
+procTrain <- train[, -1]
+
+id_test <- test$Id
+procTest <- test[, -1]
+
+## use log of sale price
+procTrain$SalePrice <- log(procTrain$SalePrice)
+
+## convert factor variables to factors
+procTrain$MSSubClass <- as.factor(procTrain$MSSubClass)
+procTest$MSSubClass <- as.factor(procTest$MSSubClass)
+
+procTrain$MoSold <- as.factor(procTrain$MoSold)
+procTest$MoSold <- as.factor(procTest$MoSold)
+
+# recode factor level 150 into 160 in test MSSubClass (exists in test but not train) 
+procTest$MSSubClass <- fct_collapse(procTest$MSSubClass, '160' = c('150', '160'))
+
+# fix typo in GarageYrBlt
+procTest$GarageYrBlt <- ifelse(procTest$GarageYrBlt == 2207, 2007, procTest$GarageYrBlt)
+
+# fix typo in YearRemodAdd
+procTest$YearRemodAdd <- ifelse(procTest$YearRemodAdd > procTest$YrSold, 
+                                procTest$YrSold, 
+                                procTest$YearRemodAdd)
+procTrain$YearRemodAdd <- ifelse(procTrain$YearRemodAdd > procTrain$YrSold, 
+                                 procTest$YrSold, 
+                                 procTest$YearRemodAdd)
+```
+
+### Missing Values: Continuous
+
+Continuous values that are missing are imputed with bagged trees: for each predictor a bagged tree is created using all of the other predictors, and the bagged model is used to predict missing values. The continuous variables that have missing values are:
+
+- LotFrontage (train: 259, test: 227)
+- MasVnrArea (train: 8, test: 15)
+- GarageYrBlt (train: 81, test: 78)
+- BsmtFinSF1 (test: 1)
+- BsmtFinSF2 (test: 1)
+- BsmtUnfSF (test: 1)
+- TotalBsmtSF (test: 1)
+- BsmtFullBath (test: )
+- BsmtHalfBath (test: 2)
+- GarageCars (test: 1)
+- GarageArea (test: 1)
+
+```{r missing_variables_continuous}
+### missing values
+#summary(is.na(procTrain))
+#summary(is.na(procTest))
+
+# impute missing continuous values with bagged trees
+full_data <- rbind(procTrain[, -80], procTest)
+numeric_cols <- which(map_lgl(full_data, is.numeric))
+
+set.seed(1001)
+bagImpute <- preProcess(full_data[, numeric_cols], method = "bagImpute")
+procTrain[, numeric_cols] <- predict(bagImpute, procTrain[, numeric_cols])
+procTest[, numeric_cols] <- predict(bagImpute, procTest[, numeric_cols])
+rm(bagImpute)
+```
+
+### Missing Values: Discrete
+
+There are two types of missing values from discrete variables: those that represent an "other" category, and those that are truly missing.
+
+For missing values that represent an "other" category, we create a new factor level to represent that category. For those that are truly missing, we impute missing values with the most common value from all other observations.
+
+```{r missing_variables_discrete}
+#### convert missing factor values into an "other" type if appropriate
+add_fctlevel <- c("Alley", "BsmtQual", "BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2",
+                  "FireplaceQu", "GarageType", "GarageFinish", "GarageQual", "GarageCond",
+                  "PoolQC", "Fence", "MiscFeature")
+
+procTrain[, add_fctlevel] <- map_df(procTrain[, add_fctlevel], addNA)
+procTest[, add_fctlevel] <- map_df(procTest[, add_fctlevel], addNA)
+
+### impute missing factor values into most common category for all other factors
+imp_fctlevel <- c("MasVnrType", "Electrical", "MSZoning", "Utilities", "Exterior1st", "Exterior2nd", "KitchenQual", "Functional", "SaleType")
+
+# function to return mode
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+for (fct in imp_fctlevel) {
+  procTrain[[fct]][is.na(procTrain[[fct]])] <- Mode(full_data[[fct]])
+  procTest[[fct]][is.na(procTest[[fct]])] <- Mode(full_data[[fct]])
+}
+rm(Mode, fct, add_fctlevel, imp_fctlevel)
+```
+
+### Additional Pre-Processing
+
+1. Ordinal categorical variables are **converted to numeric** to allow for discovery of more complex relationships between levels.
+2. Continuous variables are treated with a **box-cox transformation, centering, and scaling** for more stable modeling.
+3. A separate train/test dataset are created by **one-hot-encoding categorical variables** so that they're properly represented as dummy variables. 
+
+```{r additional_preproc}
+### convert ordered factors to numeric
+ordered_factors <- c("Alley", "LotShape", "Utilities", "LandSlope", 
+                     "ExterQual", "ExterCond", "BsmtQual", "BsmtCond", "BsmtExposure", 
+                     "BsmtFinType1", "BsmtFinType2", "HeatingQC", "KitchenQual", 
+                     "Functional", "FireplaceQu", "GarageFinish", "GarageQual", 
+                     "GarageCond", "PavedDrive", "PoolQC", "Fence")
+procTrain[, ordered_factors] <- map_df(procTrain[, ordered_factors], as.numeric)
+procTest[, ordered_factors] <- map_df(procTest[, ordered_factors], as.numeric)
+
+
+### apply boxcox, center, and scale to continuous values
+trainTrans <- preProcess(procTrain[, numeric_cols],
+                         method = c("BoxCox", "center", "scale"))
+procTrain[, numeric_cols] <- predict(trainTrans, procTrain[, numeric_cols])
+  
+testTrans <- preProcess(procTest[, numeric_cols],
+                              method = c("BoxCox", "center", "scale"))
+procTest[, numeric_cols] <- predict(testTrans, procTest[, numeric_cols])
+
+rm(trainTrans, testTrans, ordered_factors)
+
+### one-hot encode factors
+treatplan <- designTreatmentsZ(procTrain, names(procTrain[-80]), 
+                               minFraction = 0.01, rareCount = 0, verbose = FALSE)
+procTrainEnc <- prepare(treatplan, dframe = procTrain, codeRestriction = c("clean", "lev"))
+procTestEnc <- prepare(treatplan, dframe = procTest, codeRestriction = c("clean", "lev"))
+procTrainEnc$SalePrice <- procTrain$SalePrice
+
+
+```
+
+
+## Modeling
+
+We will fit an elastic net model, MARS model, and polynomial SVM on the one-hot-encoded data. Stochastic gradient boosting will be performed on the data that is not one-hot-encoded, because one-hot encoding can [lead to decreased performance in decision tree-based models.](https://medium.com/data-design/visiting-categorical-features-and-encoding-in-decision-trees-53400fa65931)
+
+Models will be evaluated with the average of 10-fold cross-validation errors, repeated 3 times. The cross-validation folds will be shared across all models for comparison later on. Model tuning and hyperparameter selection have been completed separately to decrease the amount of time it takes to run this script.
+
+```{r resampling}
+set.seed(202005181)
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 10,
+                     repeats = 3,
+                     index = createMultiFolds(procTrain$OverallQual, k = 10, times = 3),
+                     savePredictions = "final")
+```
+
+## Elastic Net 
+
+Fitting an elastic net model leads to an average 10-fold cross-validation RMSE of .1286.
+
+This model considers the total above ground living area (GrLivArea), followed closely by the neighborhood the house is located (neighborhood) and its overall quality (OverallQual) as the most important contributors to sale price.
+
+```{r elasticnetModel}
+# glmnet RMSE: 0.1285798
+glmGrid <- expand.grid(.alpha = .8, 
+                       .lambda = 0.005263158)
+set.seed(20200518)
+glmModel <- train(SalePrice ~ ., 
+                   procTrainEnc,
+                   method = "glmnet",
+                   tuneGrid = glmGrid,
+                   verbose = FALSE,
+                   trControl = ctrl)
+
+glmModel
+plot(varImp(glmModel), top = 20, main = "Variable Importance: Elastic Net")
+```
+
+### MARS
+
+A MARS (multivariate adaptive regression splines) model performs marginally worse, with an RMSE of .1297.
+
+However, only 11 predictors are used to determine the sale price, the most important being overall quality of the house (OverallQual). The model is sparse, and likely won't overfit the data compared to the other, more flexible models.
+
+```{r earthModel}
+# MARS model RMSE: .1297
+earthGrid <- expand.grid(.degree = 1,
+                         .nprune = 35)
+set.seed(20200518)
+earthModel <- train(SalePrice ~ ., 
+                    procTrainEnc,
+                    method = "earth",
+                    tuneGrid = earthGrid,
+                    trControl = ctrl)
+earthModel
+plot(varImp(earthModel), top = 15, main = "Variable Importance: MARS")
+```
+
+### Polynomial Support Vector Machine
+
+The best-performing polynomial SVM has a degree of 1, and returns an average cross-validated RMSE of .1262, which is slightly better than the two previous models.
+
+Like the MARS model, the SVM is most reliant on overall house quality in determining sale price. However, the SVM considers more variables as important, and differs in its selection of moderately important variables.
+
+```{r svmPModel}
+# svm poly RMSE: .1262140
+svmPolyGrid <- expand.grid(.degree = 1,
+                           .C = .25,
+                           .scale = .01)
+set.seed(20200518)
+svmPModel <- train(SalePrice ~ .,
+                  data = procTrainEnc,
+                  method = "svmPoly",
+                  tuneGrid = svmPolyGrid,
+                  trControl = ctrl)
+
+svmPModel
+plot(varImp(svmPModel), top = 20, main = "Variable Importance: Support Vector Machine")
+```
+
+
+### Stochastic Gradient Boosting
+
+Applying stochastic gradient boosting yields an average cross-validated error of .1235, which is the best among all of the models we've evaluated.
+
+Like MARS and SVM, overall house quality is treated as most important in determining sale price; however, boosting is unique in that overall quality is 2.5 times more important than the next most significant variable.
+
+```{r gbmModel}
+# gbm model: RMSE .12346
+gbmGrid <- expand.grid(.interaction.depth = 7,
+                        .n.trees = 2000,
+                        .shrinkage = .02,
+                        .n.minobsinnode = 15)
+set.seed(20200518) # 
+gbmModel <- train(SalePrice ~ ., 
+                  data = procTrain,
+                  method = "gbm",
+                  tuneGrid = gbmGrid,
+                  verbose = FALSE,
+                  trControl = ctrl)
+
+gbmModel
+plot(varImp(gbmModel), top = 20, main = "Variable Importance: Stochastic Gradient Boosting")
+```
+
+### Ensemble
+
+Since we used the same 10-fold cross-validation samples for all of our models, we can compare the models among each fold to determine the best linear combination of model predictions for the training dataset. This allows us to draw on the strengths of all four models. 
+
+The first table below shows a comparison of the RMSE values between all models. 
+
+The second table below shows correlation between models. The two most correlated models are elastic net and SVM, likely because they both have linear decision boundaries. Other than this relationship, all other model pairs have a correlation between 0.7 and 0.8.
+
+```{r ensemble_1}
+tuneList <- list(glmnet = caretModelSpec(method = "glmnet", tuneGrid = glmGrid))
+set.seed(20200518) 
+modelList <<- caretList(SalePrice ~ .,
+                        data = procTrainEnc,
+                        trControl = ctrl,
+                        metric = "RMSE",
+                        tuneList = tuneList) 
+modelList[["svmP"]] <- svmPModel
+modelList[["gbm"]] <- gbmModel
+modelList[["earth"]] <- earthModel
+
+summary(resamples(modelList))[[3]]$RMSE
+modelCor(resamples(modelList))
+```
+
+The ensemble is created from the best linear combination of the four models, using their shared cross-validation resampling indexes.
+
+```{r ensemble_2}
+# weighted ensemble
+set.seed(20200518)
+greedyEnsemble <- caretEnsemble(modelList, 
+                                metric = "RMSE",
+                                trControl = trainControl(method = "repeatedcv", number=10, repeats = 5))
+summary(greedyEnsemble)
+```
+
+
+## Results
+
+The model ensemble made up of elastic net, MARS, SVM, and stochastic gradient boosting scored a RMSE of .11831 (top 13%).
+
+To improve results, exploring the dataset to gain a better understanding and playing around with new features may lead to increased predictive power. Checking for outliers may also improve the robustness of the models. 
+
+```{r export_submissions, message = FALSE}
+# prepare data for prediction
+procTestEnc$Id <- id_test
+procTest$Id <- id_test
+procTestX <- full_join(procTest, procTestEnc, by = procTest$id_test)
+
+# predict and save results
+procTestX$LogSalePrice <- predict(greedyEnsemble, procTestX)
+procTestX$SalePrice <- exp(procTestX$LogSalePrice)
+
+submission <- tibble("Id" = procTestX$Id,
+                     "SalePrice" = procTestX$SalePrice)
+
+write.csv(submission, "submission.csv", row.names = FALSE, quote = FALSE)
+
+```
