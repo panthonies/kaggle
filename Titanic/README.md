@@ -3,7 +3,7 @@
 This is Kaggle's introductory competition. Details on the competition can be found [here](https://www.kaggle.com/c/titanic).
 
 Files in this folder:
-- *-Titanic.Rmd:* data analysis source code (written in R markdown)
+- *-analysis-titanic.Rmd:* source code for data analysis and modeling (written in R markdown)
 - *train.csv:* training data
 - *test.csv:* test data
 - *submission.csv:* my submission

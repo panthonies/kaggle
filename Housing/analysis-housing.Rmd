@@ -6,7 +6,7 @@ output:
   html_document:
     toc: TRUE
     toc_float: TRUE
-    code_folding: "hide"
+    code_folding: "show"
 ---
 
 
@@ -29,7 +29,7 @@ library(vtreat)             ## one hot encode and ignore factor levels with low 
 
 Alright, we're going to try and predict housing prices. The goal is to predict the final sale price of residential homes in Ames, Iowa based on information about the house.
 
-The score is judged on the root mean squared error (RMSE) of the log sale price, and my submission scores in the top 13% of results (as of May 2020). This script takes approximately 8 minutes to knit.
+The score is judged on the root mean squared error (RMSE) of the log sale price, and my submission scores in the top 13% of results (as of May 2020). This script takes approximately 8 minutes to execute.
 
 ### Import Data
 
@@ -243,7 +243,7 @@ earthModel
 plot(varImp(earthModel), top = 15, main = "Variable Importance: MARS")
 ```
 
-### Polynomial Support Vector Machine
+### Polynomial SVM
 
 The best-performing polynomial SVM has a degree of 1, and returns an average cross-validated RMSE of .1262, which is slightly better than the two previous models.
 

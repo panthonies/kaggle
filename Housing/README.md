@@ -3,7 +3,7 @@
 This is one of Kaggle's popular beginner competitions. Details on the competition can be found [here](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/).
 
 Files in this folder:
-- *Housing.Rmd:* data analysis source code (written in R markdown)
+- *analysis-housing.Rmd:* source code for data analysis and modeling (written in R markdown)
 - *train.csv:* training data
 - *test.csv:* test data
 - *submission.csv:* my submission
