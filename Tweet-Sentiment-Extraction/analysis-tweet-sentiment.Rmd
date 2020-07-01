@@ -1,0 +1,626 @@
+---
+title: "Tweet Sentiment Extraction"
+author: "Anthony Pan"
+date: "2020-07-01"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: "show"
+---
+
+```{css, echo = FALSE}
+pre code, pre, code {
+  white-space: pre !important;
+  overflow-x: scroll !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width=200)
+library(reticulate) # for python code
+library(ngram)
+library(wordcloud)
+library(tm)
+library(caret)
+library(tidyverse)
+library(textfeatures)
+library(doMC)
+registerDoMC(5)
+library(beepr)
+library(h2o)
+library(kableExtra)
+```
+
+
+## Introduction
+
+The goal of this project is to predict the word or phrase from a tweet that captures its provided sentiment. We are given a training dataset with an original tweet, its sentiment, and the selected text that captures its sentiment.
+
+The metric in this competition is the [word-level Jaccard score](https://en.wikipedia.org/wiki/Jaccard_index). A description of Jaccard similarity for strings can be found  [here](https://towardsdatascience.com/overview-of-text-similarity-metrics-3397c4601f50). 
+
+This script takes ~1 minute to compile with the help of an RData file where a lot of computationally heavy lifting has already been done.
+
+```{r import_data}
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+sample_submission <- read.csv("sample_submission.csv")
+```
+
+The training data has 27,481 tweets, and the test data has 3,534 tweets. Let's implement the evaluation method first.
+
+```{r jaccard_score}
+# modified jaccard score to take into account repeated words
+jaccard <- function (str1, str2) {
+  a = str_split(str_to_lower(str1), " ", simplify = TRUE) # lowercase, split
+  b = str_split(str_to_lower(as.character(str2)), " ", simplify = TRUE)  # lowercase, split
+  c = b[b %in% intersect(a, b)]
+  return(length(c) / (length(a) + length(b) - length(c)))
+}
+```
+
+## Basic Cleaning
+
+1. Remove one tweet that is blank.
+2. Remove leading and trailing spaces.
+3. Change the data type of text to "character" for easy manipulation.
+3. Remove any weird rows where *none* of the selected text contains words from the original text split from spaces. Note that these likely are human annotation errors and also exist in the test data set.
+
+```{r cleaning}
+## remove one row in train with blank tweet
+train <- train[!(train$text == ""), ]
+
+## change to character
+train$text <- as.character(train$text)
+train$selected_text <- as.character(train$selected_text)
+test$text <- as.character(test$text)
+
+## remove leading and trailing spaces, then add one leading space  
+# create function
+rm_spaces <- function (x) {
+  x <- x %>%
+    str_remove("^ +") %>%
+    str_remove(" +$")
+  # paste0(" ", x, " ")
+}
+
+# apply function
+train <- train %>%
+  mutate(text_clean = rm_spaces(text))
+test <- test %>%
+  mutate(text_clean = rm_spaces(text))
+
+## columns for text similarity with selected text 
+train$jaccard <- 0
+for (i in 1:nrow(train)) {
+  train$jaccard[i] <-  jaccard(train$text_clean[i], train$selected_text[i])
+} 
+rm(i)
+
+## note there are rows with weird selected text (words not created by spaces, extra chars) ...i'll remove for now 
+# train %>%
+#   filter(jaccard == 0) %>%
+#   select("text", "selected_text")
+# 
+weird_train <- train[(train$jaccard == 0), ]
+train <- train[!(train$jaccard == 0), ]
+
+# remove some weird characters
+train$text_clean <- str_replace_all(train$text_clean, "ï|¿|½", "")
+test$text_clean <- str_replace_all(test$text_clean, "ï|¿|½", "")
+
+```
+
+## Data Exploration
+
+### Sentiment Distribution
+
+The most common sentiment is neutral (~41%), followed by positive (~31%) and negative (~28%) in both training and test datasets.
+
+```{r exploration, fig.show = 'hold', out.width = '50%'}
+rbind(train = summary(train$sentiment) / length(train$sentiment),
+      test = summary(test$sentiment) / length(test$sentiment)) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive", "hover"), full_width = F)
+barchart(train$sentiment, main = "Training Sentiment Distribution", 
+         scales = list(cex = c(1.8, 1)))
+barchart(test$sentiment, main = "Test Data Sentiment Distrubution",
+         scales = list(cex = c(1.8, 1)))
+```
+
+### Comparing Selected and Original
+
+Neutral sentiments are very often captured best by the entire tweet, while positive and negative sentiments are most commonly captured by a couple of key words.
+
+```{r exploration_2}
+# proportion of selected text that is exactly the same
+train$exact_same <- as.character(train$text_clean) == as.character(train$selected_text)
+train %>%
+  group_by(sentiment) %>%
+  summarize(exact_same = sum(exact_same),
+            total_tweets = n(),
+            proportion_same = exact_same/total_tweets) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "hover"), full_width = F)
+
+train %>%
+  ggplot() +
+  geom_histogram(mapping = aes(x = jaccard, fill = sentiment), 
+                 position = 'dodge',
+                 bins = 15) + 
+  labs(title = "Similarity of original text with the portion that captures its sentiment",
+       x = "Jaccard score")
+```
+
+### Word Clouds
+
+Just for fun, here are wordclouds of the selected text for positive, neutral, and negative tweets.
+
+```{r wordcloud, echo = FALSE, warning=FALSE, fig.show = 'hold'}
+layout(matrix(c(1, 2), nrow=2), heights=c(1, 5))
+par(mar=rep(0, 4))
+plot.new()
+text(x=0.5, y=0.5, bquote(underline("Positive Tweets")), cex = 2)
+wordcloud(unlist(train %>%
+                   filter(sentiment == "positive") %>%
+                   select("selected_text")), 
+          min.freq = 30)
+
+layout(matrix(c(1, 2), nrow=2), heights=c(1, 5))
+par(mar=rep(0, 4))
+plot.new()
+text(x=0.5, y=0.5, bquote(underline("Neutral Tweets")), cex = 2)
+wordcloud(unlist(train %>%
+                   filter(sentiment == "neutral") %>%
+                   select("selected_text")), 
+          min.freq = 80)
+
+layout(matrix(c(1, 2), nrow=2), heights=c(1, 5))
+par(mar=rep(0, 4))
+plot.new()
+text(x=0.5, y=0.5, bquote(underline("Negative Tweets")), cex = 2)
+wordcloud(unlist(train %>%
+                   filter(sentiment == "negative") %>%
+                   select("selected_text")), 
+          min.freq = 22)
+```
+
+
+### Baseline submission
+
+We'll use a baseline submission that simply selects the entire text of the tweet as representative of the tweet's sentiment. This results in a score of .594 on the test dataset. 
+
+```{r baseline, eval = FALSE}
+submission <- tibble(textID = test$textID,
+                     selected_text = test$text_clean)
+write.csv(submission, "submission-baseline.csv", row.names = FALSE, quote = 2)
+```
+
+## Modeling with XGBoost 
+
+While researching natural language processing and sentiment analysis, I've discovered that the best NLP tools are written in Python (which I'll attempt to use in the next section). However, for the sake of practicing manipulating data in R and implementing an xgboost model, I will first try the following method ([inspired by this submission](https://www.kaggle.com/gomes555/ngram-predict-with-xgboost-h2o-in-r)):
+
+1. For each tweet, calculate all possible combinations (ngrams) of "selected_text" for each textID, and create a new data frame where each combination of "selected_text" represents one row.
+2. Add metadata columns to each row to represent features of each ngram, the original text, and the difference between the ngram and original. Will will use these features to **predict the Jaccard score of the ngram compared to the actual selected text.**
+3. Use xgboost to model the Jaccard score of each ngram using all of the generated features from the original and selected ngram text.
+4. With the model, predict the Jaccard score of the each test dataset ngram with the actual selected text, and **choose the ngram for each textID that has the highest predicted Jaccard score.** 
+
+```{r load_env, include = FALSE}
+load("environment-xgboost.RData") ## helper to decrease script runtime
+```
+
+### 1. Find all possible ngrams 
+
+After expanding the dataset to include all possible phrases (ngrams) that can be selected as capturing tweet sentiment, we have a table with 3,046,029 rows. 
+
+To create our response variable, I created a column to represent the Jaccard score between the ngram and the original text.
+
+```{r find_ngrams, eval = FALSE}
+### Expand Data Frames
+
+# creates all ngram combinations from a phrase
+create_ngrams <- function(text, nwords) {
+  map(1:nwords, 
+      ~ get.ngrams(ngram(text, n = .x, sep = " "))) %>%
+    unlist()
+}
+# converts strings into regex form
+to_search <- function(x){
+  str_replace_all(x, "([[:punct:]]|\\*|\\+|\\.{1,}|\\:|\\$|\\:|\\^|\\?|\\|)", "\\\\\\1")
+}
+
+expand_with_ngrams <- function(x) {
+  # create data frame with all ngrams
+  x_ngrams <- x %>% 
+    select(textID, text = text_clean, sentiment) %>%
+    mutate(nwords = map_dbl(text, wordcount),
+           ngram = map2(text, nwords, ~ create_ngrams(.x, .y))) %>%
+    select(-nwords) %>%
+    unnest(cols = c(ngram))
+  # create columns for difference between selected and original
+  x_ngrams <- x_ngrams %>%
+  mutate(ngram_diff = str_remove(text, to_search(ngram)))
+}
+
+# add jaccard column
+add_jaccard <- function(x, isTrain = TRUE) {
+  if(isTrain == TRUE) x$jaccard <- map2_dbl(x$ngram, x$selected_text, ~ jaccard(.x, .y))
+  else x$jaccard <- 0
+  return(x)
+}
+
+
+# expand train and test data
+train_ngrams <- expand_with_ngrams(train)
+train_ngrams <- add_jaccard(train_ngrams)
+
+test_ngrams <- expand_with_ngrams(test) 
+test_ngrams <- add_jaccard(test_ngrams, isTrain = FALSE)
+```
+
+#### Split Data by Sentiment
+
+We will add a column to the training data to represent the difference between the ngram and the original text, and split the neutral sentiment from the positive and negative sentiment text. 
+
+I will leave the neutral data as is and only use xgboost to create predictions the positive and negative data for a couple of reasons:
+
+1. Selecting the entire neutral text as the portion that captures its sentiment already achieves a (very good) Jaccard score of around 90%.
+2. It is much more computationally reasonable to train a model on only the positive and negative tweets.
+3. There are better methods for prediction that I will be attempting later, so a marginal increase in score doesn't matter that much to me.
+
+```{r split_ngrams, eval = FALSE, }
+# splits by sentiment
+split_sentiment <- function (x, sent) {
+  if (!(sent %in% c("positive", "negative", "neutral"))) return(print("Input a valid sentiment"))
+  y  <- x %>%
+    filter(sentiment == sent) %>%
+    select(textID, text, sel = ngram, diff = ngram_diff, jaccard)
+  return(y)
+}
+
+# split train and test data 
+pos_ngrams <- split_sentiment(train_ngrams, "positive")
+neg_ngrams <- split_sentiment(train_ngrams, "negative")
+neu_ngrams <- split_sentiment(train_ngrams, "neutral")
+
+pos_ngrams_test <- split_sentiment(test_ngrams, "positive")
+neg_ngrams_test <- split_sentiment(test_ngrams, "negative")
+neu_ngrams_test <- split_sentiment(test_ngrams, "neutral")
+```
+
+### 2. Create Text Features
+
+Let's create some features to represent key aspects of the tweet text for our model.
+
+For the original text, the selected ngram, and the remaining text, we will measure many text features, including the number of characters, words, lowercase/uppercase letters, types of punctuation, text sentiment, and more. 
+
+We will create our final predictors from this metadata by relating the selected/remaining text to the original text (i.e. proportion of characters, difference in sentiment etc.).
+
+```{r text_features, eval = FALSE}
+# get metadata of character vector
+get_metadata <- function (x) {
+  print(Sys.time())
+  metadata <- textfeatures(x, normalize = FALSE, word_dims = 0) %>%
+    mutate(n_first_person = n_first_person + n_first_personp,         # combine 1st/2nd person cols
+           n_second_person = n_second_person + n_second_personp) %>%
+    select(-n_first_personp, -n_second_personp) %>%
+    select(-n_uq_urls, -n_uq_hashtags, -n_uq_mentions,  # remove rows with near zero variance
+           -n_nonasciis, -n_urls, -n_mentions) 
+  
+    print(Sys.time())
+  return(metadata)
+}
+
+# take raw metadata and create final predictors
+parse_metadata <- function (x) {
+  x <- x %>%
+    mutate(selprop_n_hashtags = ifelse(orig_n_hashtags == 0, 0, sel_n_hashtags/orig_n_hashtags),
+          selprop_n_chars = ifelse(orig_n_chars == 0, 0, sel_n_chars/orig_n_chars),
+          selprop_n_uq_chars = ifelse(orig_n_uq_chars == 0, 0, sel_n_uq_chars/orig_n_uq_chars),
+          selprop_n_commas = ifelse(orig_n_commas == 0, 0, sel_n_commas/orig_n_commas),
+          selprop_n_digits = ifelse(orig_n_digits == 0, 0, sel_n_digits/orig_n_digits),
+          selprop_n_exclaims = ifelse(orig_n_exclaims == 0, 0, sel_n_exclaims/orig_n_exclaims),
+          selprop_n_extraspaces = ifelse(orig_n_extraspaces == 0, 0, sel_n_extraspaces/orig_n_extraspaces),
+          selprop_n_lowers = ifelse(orig_n_lowers == 0, 0, sel_n_lowers/orig_n_lowers),
+          selprop_n_lowersp = ifelse(orig_n_lowersp == 0, 0, sel_n_lowersp/orig_n_lowersp),
+          selprop_n_periods = ifelse(orig_n_periods == 0, 0, sel_n_periods/orig_n_periods),
+          selprop_n_words = ifelse(orig_n_words == 0, 0, sel_n_words/orig_n_words),
+          selprop_n_uq_words = ifelse(orig_n_uq_words == 0, 0, sel_n_uq_words/orig_n_uq_words),
+          selprop_n_caps = ifelse(orig_n_hashtags == 0, 0, sel_n_caps/orig_n_hashtags),
+          selprop_n_puncts = ifelse(orig_n_caps == 0, 0, sel_n_puncts/orig_n_caps),
+          selprop_n_capsp = ifelse(orig_n_capsp == 0, 0, sel_n_capsp/orig_n_capsp),
+          selprop_n_charsperword = ifelse(orig_n_charsperword == 0, 0, sel_n_charsperword/orig_n_charsperword),
+          selprop_sent_afinn = ifelse(orig_sent_afinn == 0, 0, sel_sent_afinn/orig_sent_afinn),
+          selprop_sent_bing = ifelse(orig_sent_bing == 0, 0, sel_sent_bing/orig_sent_bing),
+          selprop_sent_syuzhet = ifelse(orig_sent_syuzhet == 0, 0, sel_sent_syuzhet/orig_sent_syuzhet),
+          selprop_sent_vader = ifelse(orig_sent_vader == 0, 0, sel_sent_vader/orig_sent_vader),
+          selint_sent_afinn = orig_sent_afinn - sel_sent_afinn,
+          selint_sent_bing = orig_sent_bing - sel_sent_bing,
+          selint_sent_syuzhet = orig_sent_syuzhet - sel_sent_syuzhet,
+          selint_sent_vader = orig_sent_vader - sel_sent_vader,
+          selint_n_polite = orig_n_polite - sel_n_polite,
+          selprop_n_first_person = ifelse(orig_n_first_person == 0, 0, sel_n_first_person/orig_n_first_person),
+          selprop_n_second_person = ifelse(orig_n_second_person == 0, 0, sel_n_second_person/orig_n_second_person),
+          selprop_n_third_person = ifelse(orig_n_third_person == 0, 0, sel_n_third_person/orig_n_third_person),
+          selprop_n_tobe = ifelse(orig_n_tobe == 0, 0, sel_n_tobe/orig_n_tobe),
+          selprop_n_prepositions = ifelse(orig_n_prepositions == 0, 0, sel_n_prepositions/orig_n_prepositions),
+          diffprop_n_hashtags = ifelse(orig_n_hashtags == 0, 0, diff_n_hashtags/orig_n_hashtags),
+          diffprop_n_chars = ifelse(orig_n_chars == 0, 0, diff_n_chars/orig_n_chars),
+          diffprop_n_uq_chars = ifelse(orig_n_uq_chars == 0, 0, diff_n_uq_chars/orig_n_uq_chars),
+          diffprop_n_commas = ifelse(orig_n_commas == 0, 0, diff_n_commas/orig_n_commas),
+          diffprop_n_digits = ifelse(orig_n_digits == 0, 0, diff_n_digits/orig_n_digits),
+          diffprop_n_exclaims = ifelse(orig_n_exclaims == 0, 0, diff_n_exclaims/orig_n_exclaims),
+          diffprop_n_extraspaces = ifelse(orig_n_extraspaces == 0, 0, diff_n_extraspaces/orig_n_extraspaces),
+          diffprop_n_lowers = ifelse(orig_n_lowers == 0, 0, diff_n_lowers/orig_n_lowers),
+          diffprop_n_lowersp = ifelse(orig_n_lowersp == 0, 0, diff_n_lowersp/orig_n_lowersp),
+          diffprop_n_periods = ifelse(orig_n_periods == 0, 0, diff_n_periods/orig_n_periods),
+          diffprop_n_words = ifelse(orig_n_words == 0, 0, diff_n_words/orig_n_words),
+          diffprop_n_uq_words = ifelse(orig_n_uq_words == 0, 0, diff_n_uq_words/orig_n_uq_words),
+          diffprop_n_caps = ifelse(orig_n_hashtags == 0, 0, diff_n_caps/orig_n_hashtags),
+          diffprop_n_puncts = ifelse(orig_n_caps == 0, 0, diff_n_puncts/orig_n_caps),
+          diffprop_n_capsp = ifelse(orig_n_capsp == 0, 0, diff_n_capsp/orig_n_capsp),
+          diffprop_n_charsperword = ifelse(orig_n_charsperword == 0, 0, diff_n_charsperword/orig_n_charsperword),
+          diffprop_sent_afinn = ifelse(orig_sent_afinn == 0, 0, diff_sent_afinn/orig_sent_afinn),
+          diffprop_sent_bing = ifelse(orig_sent_bing == 0, 0, diff_sent_bing/orig_sent_bing),
+          diffprop_sent_syuzhet = ifelse(orig_sent_syuzhet == 0, 0, diff_sent_syuzhet/orig_sent_syuzhet),
+          diffprop_sent_vader = ifelse(orig_sent_vader == 0, 0, diff_sent_vader/orig_sent_vader),
+          diffint_sent_afinn = orig_sent_afinn - diff_sent_afinn,
+          diffint_sent_bing = orig_sent_bing - diff_sent_bing,
+          diffint_sent_syuzhet = orig_sent_syuzhet - diff_sent_syuzhet,
+          diffint_sent_vader = orig_sent_vader - diff_sent_vader,
+          diffint_n_polite = orig_n_polite - diff_n_polite,
+          diffprop_n_first_person = ifelse(orig_n_first_person == 0, 0, diff_n_first_person/orig_n_first_person),
+          diffprop_n_second_person = ifelse(orig_n_second_person == 0, 0, diff_n_second_person/orig_n_second_person),
+          diffprop_n_third_person = ifelse(orig_n_third_person == 0, 0, diff_n_third_person/orig_n_third_person),
+          diffprop_n_tobe = ifelse(orig_n_tobe == 0, 0, diff_n_tobe/orig_n_tobe),
+          diffprop_n_prepositions = ifelse(orig_n_prepositions == 0, 0, diff_n_prepositions/orig_n_prepositions)
+    )
+}
+
+# gets metadata of selected/diff text and combines them
+# input: x = [pos|neg|neu]_ngrams, orig = original_metadata
+get_all_metadata <- function(x, orig) { 
+  # get raw metadata
+  sel_metadata <- bind_cols(textID = x$textID, get_metadata(x$sel)) %>%   # selected text, up to 30 min
+    `colnames<-`(paste0("sel_", colnames(.))) 
+  diff_metadata <- bind_cols(textID = x$textID, get_metadata(x$diff)) %>%   # diff text, up to 30 min
+    `colnames<-`(paste0("diff_", colnames(.))) 
+  all_metadata <- left_join(bind_cols(sel_metadata, select(diff_metadata, -diff_textID)),   # combine
+                            orig,
+                            by = c("sel_textID" = "orig_textID")) %>%
+    rename(textID = sel_textID)
+  # parse raw metadata into final predictors
+  parsed_metadata <-  parse_metadata(all_metadata) %>%
+    mutate(jaccard = x$jaccard) %>%
+    select(textID, sel_n_words, sel_n_chars, orig_n_words, orig_n_chars, 
+           sel_sent_afinn, sel_sent_bing, sel_sent_syuzhet, sel_sent_vader,
+           selprop_n_hashtags:jaccard)
+  return(parsed_metadata)
+}
+
+### get final metadata for train and test data
+orig_metadata <- bind_cols(textID = train$textID, get_metadata(train$text_clean)) %>%
+  `colnames<-`(paste0("orig_", colnames(.)))
+pos_metadata <- get_all_metadata(pos_ngrams, orig_metadata)
+neg_metadata <- get_all_metadata(neg_ngrams, orig_metadata)
+
+orig_metadata_test <- bind_cols(textID = test$textID, get_metadata(test$text_clean)) %>%
+  `colnames<-`(paste0("orig_", colnames(.))) 
+pos_metadata_test <- get_all_metadata(pos_ngrams_test, orig_metadata_test)
+neg_metadata_test <- get_all_metadata(neg_ngrams_test, orig_metadata_test)
+```
+
+```{r save_data, include = FALSE}
+##### save this data! it took a long time to generate!
+### train
+# saveRDS(pos_metadata, file = "pos_metadata.rds") 
+# pos_metadata <- readRDS(file = "pos_metadata.rds")
+# saveRDS(neg_metadata, file = "neg_metadata.rds")
+# neg_metadata <- readRDS(file = "neg_metadata.rds")
+### test
+# saveRDS(pos_metadata_test, file = "pos_metadata_test.rds")
+# pos_metadata_test <- readRDS(file = "pos_metadata_test.rds")
+# saveRDS(neg_metadata_test, file = "neg_metadata_test.rds")
+# neg_metadata_test <- readRDS(file = "neg_metadata_test.rds")
+```
+
+### 3. Model Training
+
+I used a basic xgboost model with no tuning to model the Jaccard score of each ngram using the newly created text features. The model was created with reasonable starting parameters (learning rate = .1, sample rate = .8, max depth = 5), and took about 25 minutes to run on Kaggle's GPUs.
+
+```{r h2o_init, include = FALSE, results = "hide"}
+h2o.init()
+```
+
+```{r xgboost, eval = FALSE}
+h2o.init()
+
+### prepare data
+# train
+all_metadata <- bind_rows(pos_metadata %>% mutate(sentiment = 1), 
+                          neg_metadata %>% mutate(sentiment = -1))
+# remove the 6 least contributing predictors
+worst_predictors <- c("selprop_n_lowers", "selprop_n_hashtags", "diffprop_n_chars", "diffprop_n_caps",
+                      "diffprop_n_hashtags", "selprop_n_chars")
+all_metadata <- all_metadata[, !(names(all_metadata) %in% worst_predictors)]
+train_h2o <- all_metadata %>%
+  select(-textID) %>%
+  as.h2o()
+x <- setdiff(colnames(train_h2o), c("jaccard"))
+y <- "jaccard"
+
+# test
+all_metadata_test <- bind_rows(pos_metadata_test %>% mutate(sentiment = 1), 
+                               neg_metadata_test %>% mutate(sentiment = -1))
+all_metadata_test <- all_metadata_test[, !(names(all_metadata) %in% worst_predictors)]
+test_h2o <- all_metadata_test %>%
+  select(-textID, -jaccard) %>%
+  as.h2o
+
+all_ngrams_test <- bind_rows(pos_ngrams_test, neg_ngrams_test) 
+
+# baseline xgboost model
+ xgb1 <- h2o.xgboost(x, y, training_frame = train_h2o,
+                     nfolds = 5,
+                     seed = 2020,
+                     ntrees = 1000, # 
+                     max_depth = 5, # default
+                     learn_rate = .1,
+                     sample_rate = .8,
+                     colsample_bytree = 1, #default
+                     gamma = 0, # default
+                     # score_each_iteration = TRUE,
+                     # score_tree_interval = 25,
+                     stopping_rounds = 50,
+                     stopping_metric = "MAE",
+                     stopping_tolerance = .01)
+```
+
+#### Summary
+
+A summary of the model is shown below. The model has a training set MAE (mean average error) of .1156, which is alright (but not great), given the Jaccard score ranges from 0 to 1. 
+
+I was expecting the model to stop early (before fitting all 1000 trees), but it turns out the MAE just kept decreasing. If I were to re-run this model, I would collect scoring information every 25 trees to determine a reasonable number of trees to stop at for further tuning.  
+
+```{r xgboost_summary}
+h2o.performance(xgb1) 
+```
+
+#### Variable Importance
+
+Taking a look at variable importance, we see that the top 5 variables that contribute to a higher Jaccard score for the selected text of positive and negative tweets are:
+
+1. Sentiment of remaining text (VADER) / Sentiment of original text (VADER) 
+2. The number of characters in the original text
+3. Sentiment of selected text (AFINN) / Sentiment of original text (AFINN)
+4. The number of words in the original text
+5. The proportion of unique words of selected text to original text
+
+```{r xgboost_varimp}
+h2o.varimp(xgb1)
+h2o.varimp_plot(xgb1)
+```
+
+### 4. Prediction
+
+We'll use the untuned xgboost model to predict the Jaccard score of each possible ngram with its original text. For each unique text, we'll choose the ngram with the highest predicted Jaccard score as the portion of text that captures its sentiment. 
+
+```{r xgb_sub, results = 'hide'}
+##### PREDICTION!
+pred <- as_tibble(predict(xgb1, test_h2o))
+
+### RESULTS
+raw_results <- all_metadata_test %>%
+  bind_cols(all_ngrams_test, pred) %>%
+  select(textID, text, sel, predict) %>%
+  group_by(textID) %>%
+  top_n(1, predict) 
+```
+
+There were two tweets where the predicted Jaccard score for two difference ngrams were the exact same. In this case, we select the ngram with fewer words. 
+
+Let's take a look at the duplicates and the final results, and then write the submission file!
+
+```{r xgb_sub_2}
+# get duplicates
+dup_results <- raw_results %>% 
+  filter(n() > 1) %>%
+  ungroup()
+head(dup_results) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("responsive", "striped", "hover"))
+
+# get full results without duplicates
+full_results <- raw_results %>% 
+  distinct(textID, predict, .keep_all = T) %>%
+  ungroup()
+head(full_results, 10)[-c(4, 5),] %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("responsive", "striped", "hover"))
+
+# get final results
+final_results <- full_results %>%
+  select(textID, sel)
+
+### SUBMISSION
+# get positives
+sub_pn <- test %>% 
+  filter(sentiment != "neutral") %>%
+  left_join(full_results, by = "textID") %>%
+  select(textID, selected_text = sel)
+# get negatives
+sub_neutrals <- test %>%
+  filter(sentiment == "neutral") %>%
+  select(textID, selected_text = text_clean)
+# combine into full submission
+sub <- bind_rows(sub_pn, sub_neutrals)
+
+submission <- sample_submission %>%
+  select(-selected_text) %>%
+  left_join(sub, by = "textID")
+
+write.csv(submission, "submission-xgboost.csv", row.names = FALSE, quote = 2)
+```
+
+
+### 5. Results
+
+The xgboost model predictions resulted in a mean Jaccard score of .658 (calculated with 30% of the test data), which is in the top 78% of scores on Kaggle at the time of submission. This is a good improvement of our baseline submission of .594.
+
+I expect that I could raise the prediction score a fair amount if I spent time tuning the hyperparameters of xgboost, but I won't do that for the sake of time. Overall, I feel pretty good about the amount I've learned about natural language processing and all of the practice I've gotten with writing code in R.
+
+Next, I'll attempt to use a more modern, state-of-the-art language model for prediction. Stay tuned!
+
+
+## Modeling with RoBERTa
+
+While attempting to find a solution to this problem in R, I noticed that all of the high-scoring public kernels were written in Python using a state-of-the-art bidirectional transformer model called RoBERTa, which is an updated version of a similar model called BERT. In particular, many people were iterating on the code of [this PyTorch implementation of BERT](https://www.kaggle.com/abhishek/bert-base-uncased-using-pytorch) and [this Tensorflow implementation of RoBERTa](https://www.kaggle.com/cdeotte/tensorflow-roberta-0-705/comments).
+
+I decided to take some time and familiarize myself with NLP models, word tokenization, transformers, self-attention, and  BERT/RoBERTa using those two resources as a starting point. 
+
+### 1. Motivation and Overview
+
+BERT and RoBERTa have a couple of advantages in comparison with my previous method:
+
+- Directly chooses a portion of the tweet as the answer. This allows for the direct calculation of a cross-validation error rate that can approximate the actual submission error.
+- Is able to select phrases based on character, effectively dealing with the weird cases we saw where the work splitting is not exactly on the space.
+- Handles text comprehension and word context in a much more sophisticated way, since word associations have been trained on a very large English corpus (Wikipedia and BookCorpus for BERT, + additional sources for RoBERTa). Previously, we were only comparing the difference in positive/negative sentiment between the tweets and selected texts.
+
+
+A simplified overview of the RoBERTa implementation with 5 folds that I used:
+ 
+1. Tokenize the training and testing data in a format that can be recognized by RoBERTa. 
+2. Create a loss function to minimize the combined cross-entropy loss of the position of the selected text start index and the selected text end index.
+3. Load a pre-trained RoBERTa model, and use tensorflow to add neural network layers to estimate the probability of start/end index, using the AdamW optimizer.
+4. Split the data into 5 folds, shuffle the data, and train the model for 3 epochs. For each fold, select the best start and end indexes for the selected tweet text for the out-of-fold training data. 
+5. From all 5 model predictions for the test data, average the probabilities of each word in the each tweet being the start and end of the selected tweet text. Finally, choose the start and end index for each tweet with the highest probability.
+6. Perform minimal preprocessing on the final output to account for noise in the data.
+
+
+### 2. Failed Attempts
+
+I tried many things that didn't increase my score, including:
+
+- Using pseudolabels with the full dataset of tweets
+- Adding additional sentiment for each tweet from the full dataset that the tweets were taken from
+- Different encoding methods/formats when passing data into RoBERTa
+- Passing additional information about the tweet (word length, number of characters) into RoBERTa
+
+
+### 3. Final Model and Results
+
+[Link to final model on Kaggle!](https://www.kaggle.com/panthonies/roberta-ensemble-top-6)
+
+For my final submission, I used an ensemble of two RoBERTa models that scored fairly well individually (.715 and .714 on the public leaderboard). In the end, I found it difficult to improve much on the solid baseline models that were publicly available. 
+
+Very big thanks to [Chris Deotte](https://www.kaggle.com/cdeotte/tensorflow-roberta-0-705/comments) and [Sazuma](https://www.kaggle.com/shoheiazuma/tweet-sentiment-roberta-pytorch) for their great public kernels that I used as a starting point. 
+
+The model scored .71735 on the final leaderboad, which was in the top 6% of solutions.
+
+
+
+
+

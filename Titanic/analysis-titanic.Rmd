@@ -1,13 +1,12 @@
 ---
-title: "Kaggle: Predicting Survival on the Titanic"
+title: "Predicting Survival on the Titanic"
 author: "Anthony Pan"
 date: "2020-05-07"
 output: 
-  html_document: 
-    code_folding: hide
-    keep_md: yes
-    toc: yes
-    toc_float: yes
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: "show"
 ---
 
 
@@ -23,7 +22,7 @@ registerDoMC(5)
 
 ## Introduction
 
-This is my first Kaggle exercise! The goal is to predict which passengers survived the Titanic shipwreck, given a set of attributes about the passengers. This file takes < 60 seconds to knit, and as of May 2020, the result places within the top 12% of submissions.
+This is my first Kaggle exercise! The goal is to predict which passengers survived the Titanic shipwreck, given a set of attributes about the passengers. This file takes < 60 seconds to execute, and as of May 2020, the result places within the top 12% of submissions.
 
 Kaggle allows us to skip the processes of data gathering, architecture, governance, and extraction, so we can move straight to importing and cleaning the data.
 
@@ -38,7 +37,7 @@ For each passenger, there are 10 predictors along with their passenger ID:
 - Sex (male/female)
 - Age (years)
 - SibSp (# siblings and spouses aboard the Titanic)
-- Parch (# parents and children abard the Titanic)
+- Parch (# parents and children aboard the Titanic)
 - Ticket (ticket number)
 - Fare (passenger fare)
 - Cabin (cabin number)
@@ -88,7 +87,7 @@ train %>%
 
 I created a new variable called "Title" to represent the passenger's title extracted from their name. 
 
-There were a number of infrequently occuring titles, so I decided to fit them all into five categories: "Master", "Mr", "Mrs", "Miss", and "Royal" (for titles that indicated royalty). We can see that passengers with different titles have significantly different survival rates.
+There were a number of infrequently occurring titles, so I decided to fit them all into five categories: "Master", "Mr", "Mrs", "Miss", and "Royal" (for titles that indicated royalty). We can see that passengers with different titles have significantly different survival rates.
 
 ```{r feature_eng_1}
 ### create Title from Name (train)
@@ -465,7 +464,7 @@ test$rawpredictions <- ifelse(test$predictions == "Dead", 0, 1)
 submission <- tibble("PassengerId" = test$PassengerId,
                      "Survived" = test$rawpredictions)
 
-write.csv(submission, "submission.csv", row.names = FALSE, quote = FALSE)
+write.csv(submission, "titanic-submission.csv", row.names = FALSE, quote = FALSE)
 ```
 
 
