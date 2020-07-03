@@ -1,5 +1,5 @@
 # Kaggle Competitions
 
-This repository contains the source code for Kaggle competitions that I enter.
+This repository contains my solutions to the Kaggle data science competitions that I enter.
 
-kaggle.com/panthonies
+Kaggle Profile: [kaggle.com/panthonies](kaggle.com/panthonies)

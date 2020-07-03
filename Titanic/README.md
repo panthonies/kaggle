@@ -1,6 +1,6 @@
 # Predicting Survival on the Titanic
 
-This is Kaggle's introductory competition. Details on the competition can be found [here](https://www.kaggle.com/c/titanic).
+This is Kaggle's introductory competition, where the goal is to create a classification model to predict whether passengers survived the Titanic. Details on the competition can be found [here](https://www.kaggle.com/c/titanic).
 
 Files in this folder:
 - *-analysis-titanic.Rmd:* source code for data analysis and modeling (written in R markdown)
