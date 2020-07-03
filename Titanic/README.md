@@ -2,6 +2,8 @@
 
 This is Kaggle's introductory competition, where the goal is to create a classification model to predict whether passengers survived the Titanic. Details on the competition can be found [here](https://www.kaggle.com/c/titanic).
 
+For my submission, I created a weighted ensemble of 5 models: logistic regression, linear discriminant analysis, linear SVM, polynomial SVM, and random forest. 
+
 Files in this folder:
 - *-analysis-titanic.Rmd:* source code for data analysis and modeling (written in R markdown)
 - *train.csv:* training data
